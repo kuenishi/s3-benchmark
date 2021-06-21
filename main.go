@@ -194,6 +194,12 @@ func parseFlags() {
 	if benchmarkType != "get" && benchmarkType != "put" {
 		panic("Unknown benchmark type")
 	}
+
+	fmt.Printf("bucket=%s, \tendpoint=%s\n", bucketName, endpoint)
+	fmt.Printf("payload: min=%d, max=%d\n", payloadsMin, payloadsMax)
+	fmt.Printf("threads: min=%d, max=%d\n", threadsMin, threadsMax)
+	fmt.Printf("samples: %d\n", samples)
+	fmt.Printf("benchmark type: %s\n", benchmarkType)
 }
 
 func setupS3Client() {
@@ -762,7 +768,8 @@ func getInstanceType() string {
 	link := "http://169.254.169.254/latest/meta-data/instance-type"
 	response, err := httpClient.Get(link)
 	if err != nil {
-		return ""
+		// If it's not AWS, we assume on-prem
+		return "metal"
 	}
 
 	content, _ := ioutil.ReadAll(response.Body)
