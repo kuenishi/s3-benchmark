@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha1"
 	"context"
+	"crypto/sha1"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -99,6 +99,8 @@ var createBucket bool
 // the S3 SDK client
 var s3Client *s3.Client
 
+var benchmarkType string
+
 // program entry point
 func main() {
 	// parse the program arguments and set the global variables
@@ -137,7 +139,8 @@ func parseFlags() {
 	cleanupArg := flag.Bool("cleanup", false, "Cleans all the objects uploaded to S3 for this test.")
 	csvResultsArg := flag.String("upload-csv", "", "Uploads the test results to S3 as a CSV file.")
 	createBucketArg := flag.Bool("create-bucket", true, "Create the bucket")
-	
+	benchmarkTypeArg := flag.String("benchmark-type", "get", "Benchmark type [put, get]")
+
 	// parse the arguments and set all the global variables accordingly
 	flag.Parse()
 
@@ -186,6 +189,11 @@ func parseFlags() {
 		payloadsMax = 15 // 16 MB
 		throttlingMode = *throttlingModeArg
 	}
+
+	benchmarkType = *benchmarkTypeArg
+	if benchmarkType != "get" && benchmarkType != "put" {
+		panic("Unknown benchmark type")
+	}
 }
 
 func setupS3Client() {
@@ -208,7 +216,6 @@ func setupS3Client() {
 		opts = append(opts, config.WithEndpointResolver(resolver))
 	}
 
-
 	// gets the AWS credentials from the default file or from the EC2 instance profile
 	cfg, err := config.LoadDefaultConfig(context.TODO(), opts...)
 	if err != nil {
@@ -222,6 +229,8 @@ func setupS3Client() {
 
 	// crete the S3 client
 	s3Client = s3.NewFromConfig(cfg)
+
+	cfg.ClientLogMode |= aws.LogResponse | aws.LogRequest
 }
 
 func setup() {
@@ -235,7 +244,7 @@ func setup() {
 			//},
 		}
 
-		// AWS S3 has this peculiar issue in which if you want to create bucket in us-east-1 region, you should NOT specify 
+		// AWS S3 has this peculiar issue in which if you want to create bucket in us-east-1 region, you should NOT specify
 		// any location constraint. https://github.com/boto/boto3/issues/125
 		if strings.ToLower(region) == "us-east-1" {
 			createBucketReq = &s3.CreateBucketInput{
@@ -248,7 +257,7 @@ func setup() {
 		// if the error is because the bucket already exists, ignore the error
 		if err != nil && !strings.Contains(err.Error(), "BucketAlreadyOwnedByYou:") {
 			panic("Failed to create S3 bucket: " + err.Error())
-		}	
+		}
 	}
 
 	// an object size iterator that starts from 1 KB and doubles the size on every iteration
@@ -371,6 +380,139 @@ func runBenchmark() {
 	}
 }
 
+func doGet(key string, payloadSize uint64, results chan<- latency) *latency {
+	// create a buffer to copy the S3 object body to
+	buf := make([]byte, payloadSize)
+
+	// do the GetObject request
+	req := &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(key),
+	}
+
+	// start the timer to measure the first byte and last byte latencies
+	latencyTimer := time.Now()
+
+	resp, err := s3Client.GetObject(context.TODO(), req)
+	if err != nil {
+		panic("Failed to get object: " + err.Error())
+	}
+	defer resp.Body.Close()
+
+	// measure the first byte latency
+	firstByte := time.Now().Sub(latencyTimer)
+
+	// read the s3 object body into the buffer
+	size := 0
+	for {
+		n, err := resp.Body.Read(buf)
+
+		size += n
+
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			panic("Error reading object body: " + err.Error())
+		}
+	}
+
+	// measure the last byte latency
+	lastByte := time.Now().Sub(latencyTimer)
+
+	return &latency{FirstByte: firstByte, LastByte: lastByte}
+}
+
+type BenchReader struct {
+	start     time.Time
+	firstByte time.Duration
+	lastByte  time.Duration
+	bytesSent int
+	buf       []byte
+}
+
+func NewBenchReader(objectSize uint64) *BenchReader {
+	return &BenchReader{
+		start:     time.Now(),
+		buf:       make([]byte, objectSize),
+		bytesSent: 0,
+	}
+}
+
+func Min(x, y int) int {
+	if x < y {
+		return x
+	}
+	return y
+}
+func (br *BenchReader) Read(readBuf []byte) (int, error) {
+	if br.bytesSent == 0 {
+		br.firstByte = time.Now().Sub(br.start)
+	} else if br.bytesSent == len(br.buf) {
+		return 0, io.EOF
+	}
+	copied := copy(readBuf, br.buf[br.bytesSent:])
+	br.bytesSent += copied
+
+	if br.bytesSent >= len(br.buf) {
+		br.lastByte = time.Now().Sub(br.start)
+	}
+	// fmt.Printf("sent=%d/%d, read=%d\n", br.bytesSent, len(br.buf), len(readBuf))
+	return copied, nil
+}
+func (br *BenchReader) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		{
+			br.bytesSent = int(offset)
+		}
+	case io.SeekCurrent:
+		{
+			br.bytesSent += int(offset)
+		}
+	case io.SeekEnd:
+		{
+			br.bytesSent = len(br.buf) - int(offset)
+		}
+	}
+	if br.bytesSent < 0 {
+		br.bytesSent = 0
+	} else if br.bytesSent > len(br.buf) {
+		br.bytesSent = len(br.buf)
+	}
+	return int64(br.bytesSent), nil
+}
+func (br *BenchReader) Close() {
+}
+
+func doPut(key string, payloadSize uint64, results chan<- latency) *latency {
+	reader := NewBenchReader(payloadSize)
+	defer reader.Close()
+
+	// do a PutObject request to create the object
+	put := &s3.PutObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(key),
+		Body:   reader, // bytes.NewReader(payload),
+	}
+
+	// if the put fails, exit
+	_, err := s3Client.PutObject(context.TODO(), put)
+	if err != nil {
+		panic("Failed to put S3 object: " + err.Error())
+	}
+
+	return &latency{FirstByte: reader.firstByte, LastByte: reader.lastByte}
+}
+
+func taskFunc() func(key string, payloadSize uint64, results chan<- latency) *latency {
+	if benchmarkType == "get" {
+		return doGet
+	} else if benchmarkType == "put" {
+		return doPut
+	}
+	panic("do not come here")
+}
+
 func execTest(threadCount int, payloadSize uint64, runNumber int, csvRecords [][]string) [][]string {
 	// this overrides the sample count on small hosts that can get overwhelmed by a large throughput
 	samples := getTargetSampleCount(threadCount, samples)
@@ -381,59 +523,17 @@ func execTest(threadCount int, payloadSize uint64, runNumber int, csvRecords [][
 	// a channel to receive results from the test tasks back on the main thread
 	results := make(chan latency, samples)
 
+	do := taskFunc()
+
 	// create the workers for all the threads in this test
 	for w := 1; w <= threadCount; w++ {
 		go func(o int, tasks <-chan int, results chan<- latency) {
 			for range tasks {
 				// generate an S3 key from the sha hash of the hostname, thread index, and object size
 				key := generateS3Key(hostname, o, payloadSize)
-
-				// start the timer to measure the first byte and last byte latencies
-				latencyTimer := time.Now()
-
-				// do the GetObject request
-				req := &s3.GetObjectInput{
-					Bucket: aws.String(bucketName),
-					Key:    aws.String(key),
-				}
-
-				resp, err := s3Client.GetObject(context.TODO(), req);
-
-				// if a request fails, exit
-				if err != nil {
-					panic("Failed to get object: " + err.Error())
-				}
-
-				// measure the first byte latency
-				firstByte := time.Now().Sub(latencyTimer)
-
-				// create a buffer to copy the S3 object body to
-				var buf = make([]byte, payloadSize)
-
-				// read the s3 object body into the buffer
-				size := 0
-				for {
-					n, err := resp.Body.Read(buf)
-
-					size += n
-
-					if err == io.EOF {
-						break
-					}
-
-					// if the streaming fails, exit
-					if err != nil {
-						panic("Error reading object body: " + err.Error())
-					}
-				}
-
-				_ = resp.Body.Close()
-
-				// measure the last byte latency
-				lastByte := time.Now().Sub(latencyTimer)
-
+				lat := do(key, payloadSize, results)
 				// add the latency result to the results channel
-				results <- latency{FirstByte: firstByte, LastByte: lastByte}
+				results <- *lat
 			}
 		}(w, testTasks, results)
 	}
