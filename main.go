@@ -644,8 +644,15 @@ func printHeader(objectSize uint64) {
 		instanceTypeString = " (" + instanceType + ")"
 	}
 
-	// print the table header
-	fmt.Printf("Download performance with \033[1;33m%-s\033[0m objects%s\n", byteFormat(float64(objectSize)), instanceTypeString)
+	var workloadType string
+	if benchmarkType == "get" {
+		workloadType = "Download"
+	} else if benchmarkType == "put" {
+		workloadType = "Upload"
+	} else {
+		panic(benchmarkType)
+	}
+	fmt.Printf("%s performance with \033[1;33m%-s\033[0m objects%s\n", workloadType, byteFormat(float64(objectSize)), instanceTypeString)
 	fmt.Println("                           +-------------------------------------------------------------------------------------------------+")
 	fmt.Println("                           |            Time to First Byte (ms)             |            Time to Last Byte (ms)              |")
 	fmt.Println("+---------+----------------+------------------------------------------------+------------------------------------------------+")
